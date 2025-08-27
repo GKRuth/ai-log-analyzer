@@ -1,0 +1,311 @@
+{
+  "name": "bot-and-reports (example)",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1,
+      "position": [-1200, -600]
+    },
+    {
+      "parameters": {
+        "jsCode": "// нормализуем вход и ставим метку времени старта
+const m = $json.message || $json.edited_message || {};
+const started = Date.now();
+const reqId = Math.random().toString(36).slice(2,10).toUpperCase();
+return [{ json: {
+  started_at: started,
+  chat_id: m.chat?.id,
+  user_id: m.from?.id,
+  message_id: m.message_id,
+  text: (m.text ?? '').slice(0, 1500),
+  request_id: reqId
+}}];"
+      },
+      "name": "Init & Start Timer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-960, -600]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.LLM_BASE_URL}}/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{$env.LLM_API_KEY}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={
+  \"model\": \"={{$env.LLM_MODEL}}\",
+  \"messages\": [
+    { \"role\": \"system\", \"content\": \"Отвечай кратко (1–2 предложения), по-русски. Без Markdown и JSON.\" },
+    { \"role\": \"user\", \"content\": \"={{ $item(0).$node['Init & Start Timer'].json.text || $item(0).$node['Telegram Trigger'].json.message.text || '' }}\" }
+  ],
+  \"temperature\": 0.2,
+  \"max_tokens\": {{ Number($env.LLM_MAX_TOKENS || 120) }}
+}"
+      },
+      "name": "Chat LLM (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-720, -600]
+    },
+    {
+      "parameters": {
+        "jsCode": "const resp = $json.body ?? $json;
+let txt = resp?.choices?.[0]?.message?.content ?? resp?.choices?.[0]?.text ?? resp?.output_text ?? '';
+return [{ json: { ...$json, reply_text: String(txt||'').trim() || 'Готов помочь.' } }];"
+      },
+      "name": "Ensure Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-520, -600]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id || $item(0).$node['Init & Start Timer'].json.chat_id || $json.message?.chat?.id }}",
+        "text": "={{ $json.reply_text }}",
+        "additionalFields": { "appendAttribution": false, "parse_mode": "None" }
+      },
+      "name": "Telegram Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [-320, -600]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Log — формируем запись и пакет для Loki
+const init = $('Init & Start Timer').item.json;
+const ended_ms = Date.now();
+const latency_ms = ended_ms - init.started_at;
+const resp = $json.body ?? $json;
+const usage = resp?.usage || {};
+const record = {
+  ts: new Date().toISOString(),
+  chat_id: String(init.chat_id),
+  user_id: String(init.user_id||''),
+  request_id: String(init.request_id),
+  started_at_ms: init.started_at,
+  ended_at_ms,
+  latency_ms,
+  status: 'ok',
+  model: String($env.LLM_MODEL || 'llm'),
+  tokens_in: usage.prompt_tokens ?? usage.inputTokens ?? 0,
+  tokens_out: usage.completion_tokens ?? usage.outputTokens ?? 0,
+  reply_text: String($json.reply_text||'').slice(0, 4000)
+};
+return [{ json: {
+  ...$json,
+  latency_ms,
+  loki_body: { streams: [{
+    stream: { app: 'n8n-bot', chat_id: record.chat_id, user_id: record.user_id, request_id: record.request_id, model: record.model, status: record.status },
+    values: [[ String(Date.now()*1e6), JSON.stringify(record) ]]
+  }]}
+}}];"
+      },
+      "name": "Build Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-720, -360]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.LOKI_URL}}/loki/api/v1/push",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ {"name": "Content-Type", "value": "application/json"} ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.loki_body }}"
+      },
+      "name": "Push to Loki",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-520, -360]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "version": 2 },
+          "conditions": [
+            { "leftValue": "={{ Number($json.latency_ms || 0) > Number($env.SLOW_THRESHOLD_MS || 60000) }}", "operator": {"type":"boolean","operation":"true","singleValue": true} }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Slow? > threshold",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-320, -360]
+    },
+    {
+      "parameters": {
+        "jsCode": "// окно поиска по chat_id+request_id
+const init = $('Init & Start Timer').item.json;
+const start = Math.max(0, init.started_at - 120000);
+const end   = Date.now() + 60000;
+return [{ json: {
+  chat_id: String(init.chat_id),
+  request_id: String(init.request_id),
+  loki_query: `{app=\\"n8n-bot\\", chat_id=\\"${init.chat_id}\\", request_id=\\"${init.request_id}\\"} | json`,
+  start_ns: String(start*1e6),
+  end_ns: String(end*1e6),
+  limit: 1000,
+  direction: 'backward'
+}}];"
+      },
+      "name": "Make Loki Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-120, -360]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.LOKI_URL}}/loki/api/v1/query_range",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          {"name":"query","value":"={{$json.loki_query}}"},
+          {"name":"start","value":"={{$json.start_ns}}"},
+          {"name":"end","value":"={{$json.end_ns}}"},
+          {"name":"limit","value":"={{$json.limit}}"},
+          {"name":"direction","value":"backward"}
+        ]}
+      },
+      "name": "Fetch Loki Window",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [80, -360],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// парсим Loki + метрики + промпт
+const res = $json?.data?.result ?? $json?.body?.data?.result ?? [];
+const logs = [];
+for (const s of res) for (const [ts, line] of (s.values||[])) { try { logs.push(JSON.parse(line)); } catch { logs.push({raw: line}); } }
+const lat = logs.map(e=>e.latency_ms).filter(n=>typeof n==='number').sort((a,b)=>a-b);
+const p95 = lat.length ? Math.trunc(lat[Math.floor(0.95*(lat.length-1))]) : null;
+const max = lat.length ? lat[lat.length-1] : null;
+const errors = logs.filter(e=>e.status==='error'||e.error).length;
+const model = (logs.find(e=>e.model)?.model) || 'unknown';
+const user_id = logs.find(e=>e.user_id)?.user_id || '';
+const request_id = logs.find(e=>e.request_id)?.request_id || $('Init & Start Timer').item.json.request_id;
+const sample = logs.slice(0,20).map(e => JSON.stringify(e).slice(0,300)).join('\n');
+const metrics = { count: logs.length, p95_ms: p95, max_ms: max, errors, model, user_id, request_id };
+const header = `Ты DevOps-ассистент. Дай краткий отчёт (5–8 строк), без Markdown/JSON.`;
+const prompt = `${header}\nМетрики: ${JSON.stringify(metrics)}\nФрагменты логов:${sample ? '\n'+sample : ' (пусто)'}\n`;
+return [{ json: { ...$json, metrics, request_id, prompt } }];"
+      },
+      "name": "Build Metrics & Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [280, -360]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "version": 2 },
+          "conditions": [ { "leftValue": "={{ String($env.LLM_ENABLED || '1') === '1' }}", "operator": {"type":"boolean","operation":"true","singleValue": true} } ],
+          "combinator": "and"
+        }
+      },
+      "name": "LLM enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [480, -360]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.LLM_BASE_URL}}/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{$env.LLM_API_KEY}}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={
+  \"model\": \"={{$env.LLM_MODEL}}\",
+  \"messages\": [
+    { \"role\": \"system\", \"content\": \"Ты DevOps-помощник. Будь кратким и по делу.\" },
+    { \"role\": \"user\", \"content\": \"={{$json.prompt}}\" }
+  ],
+  \"temperature\": 0.2,
+  \"max_tokens\": 180
+}"
+      },
+      "name": "OpenRouter Analyze (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, -440],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const resp = $json.body ?? $json;
+let txt = resp?.choices?.[0]?.message?.content ?? resp?.choices?.[0]?.text ?? resp?.output_text ?? '';
+if (typeof txt !== 'string') txt = String(txt||'');
+const m = $('Build Metrics & Prompt').item.json.metrics || {};
+if (!txt.trim()) txt = `Авто-резюме: текста нет. events=${m.count||0}, p95=${m.p95_ms||'—'} ms, max=${m.max_ms||'—'} ms, errors=${m.errors||0}`;
+return [{ json: { ...$('Build Metrics & Prompt').item.json, ai_summary: txt } }];"
+      },
+      "name": "Extract Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, -440]
+    },
+    {
+      "parameters": {
+        "jsCode": "const m = $json.metrics || {};
+const text = [
+  `🧾 Отчёт по запросу ${$json.request_id || '(нет id)'}`,
+  `— событий: ${m.count ?? 0}`,
+  `— p95: ${m.p95_ms ?? '—'} ms, max: ${m.max_ms ?? '—'} ms`,
+  `— ошибок: ${m.errors ?? 0}`,
+  '',
+  $json.ai_summary || '(нет ответа от модели)'
+].join('\n');
+return [{ json: { ...$json, report_text: text } }];"
+      },
+      "name": "Build Report Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, -440]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$env.REPORT_CHAT_ID}}",
+        "text": "={{$json.report_text}}",
+        "additionalFields": { "appendAttribution": false, "parse_mode": "None" }
+      },
+      "name": "Telegram Send Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1280, -440]
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": { "main": [[{ "node": "Init & Start Timer", "type": "main", "index": 0 }]] },
+    "Init & Start Timer": { "main": [[{ "node": "Chat LLM (HTTP)", "type": "main", "index": 0 }]] },
+    "Chat LLM (HTTP)": { "main": [[{ "node": "Ensure Text", "type": "main", "index": 0 }]] },
+    "Ensure Text": { "main": [[{ "node": "Telegram Send Reply", "type": "main", "index": 0 }, { "node": "Build Log", "type": "main", "index": 0 }]] },
+    "Build Log": { "main": [[{ "node": "Push to Loki", "type": "main", "index": 0 }, { "node": "Slow? > threshold", "type": "main", "index": 0 }]] },
+    "Slow? > threshold": { "main": [[{ "node": "Make Loki Window", "type": "main", "index": 0 }]] },
+    "Make Loki Window": { "main": [[{ "node": "Fetch Loki Window", "type": "main", "index": 0 }]] },
+    "Fetch Loki Window": { "main": [[{ "node": "Build Metrics & Prompt", "type": "main", "index": 0 }]] },
+    "Build Metrics & Prompt": { "main": [[{ "node": "LLM enabled?", "type": "main", "index": 0 }]] },
+    "LLM enabled?": { "main": [[{ "node": "OpenRouter Analyze (HTTP)", "type": "main", "index": 0 }]] },
+    "OpenRouter Analyze (HTTP)": { "main": [[{ "node": "Extract Summary", "type": "main", "index": 0 }]] },
+    "Extract Summary": { "main": [[{ "node": "Build Report Text", "type": "main", "index": 0 }]] },
+    "Build Report Text": { "main": [[{ "node": "Telegram Send Report", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" }
+}
