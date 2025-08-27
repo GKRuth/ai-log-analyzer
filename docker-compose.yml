@@ -1,0 +1,92 @@
+version: "3.9"
+
+services:
+  n8n:
+    image: n8nio/n8n:1.107.4
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PORT=${N8N_PORT}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - GENERIC_TIMEZONE=Europe/Moscow
+      - NODE_FUNCTION_ALLOW_BUILTIN=buffer,crypto
+      - NODE_FUNCTION_ALLOW_EXTERNAL=
+      - WEBHOOK_URL=
+      - LOKI_URL=${LOKI_URL}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_ENABLED=${LLM_ENABLED}
+      - MAX_LLM_CALLS_PER_DAY=${MAX_LLM_CALLS_PER_DAY}
+      - REPORT_CHAT_ID=${REPORT_CHAT_ID}
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n-data:/home/node/.n8n
+    networks: [proxy]
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    networks: [proxy]
+    depends_on: [loki]
+
+  loki:
+    image: grafana/loki:latest
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - ./loki/config/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    networks: [proxy]
+
+  promtail:
+    image: grafana/promtail:latest
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./promtail/config/promtail-config.yml:/etc/promtail/config.yml:ro
+    networks: [proxy]
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [proxy]
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+
+volumes:
+  n8n-data:
+  grafana-data:
+  loki-data:
+  prometheus-data:
+
+networks:
+  proxy:
+    external: true
