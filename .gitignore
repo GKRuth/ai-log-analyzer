@@ -1,0 +1,9 @@
+# secrets & env
+.env
+.env.*
+# n8n exports (кроме примеров)
+n8n/workflows/*.json
+!n8n/workflows/*.example.json
+# misc
+*.log
+.DS_Store
