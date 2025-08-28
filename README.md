@@ -1,4 +1,4 @@
-[n_8_n_telegram_loki_reports_git_hub_package (1).md](https://github.com/user-attachments/files/22005649/n_8_n_telegram_loki_reports_git_hub_package.1.md)
+(https://github.com/user-attachments/files/22005649/n_8_n_telegram_loki_reports_git_hub_package.1.md)
 # n8n-telegram-loki-reports
 
 Телеграм-бот на **n8n** с «умными» отчётами о медленных запросах (Loki + Grafana), Prometheus/Node Exporter для метрик. Ориентир: одна ВМ (\~7 ГБ RAM), всё в Docker. Можно работать с внешним LLM (OpenRouter) или локальным (Ollama/LM Studio).
